@@ -9,6 +9,7 @@ export type ProofState = {
 
 export type DayState = {
   date: string;
+  taskOrder: string[];
   tasks: Record<string, boolean>;
   proofs: Record<string, ProofState | undefined>;
   mood?: Mood;

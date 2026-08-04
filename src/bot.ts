@@ -11,6 +11,7 @@ const ACTION_TODAY = "action:today";
 const ACTION_TOO_HARD = "action:too_hard";
 const ACTION_SUMMARY = "action:summary";
 const ACTION_SKIP_PROOF = "action:skip_proof";
+const SUMMARY_SEPARATOR = "\n\n--------------------\n\n";
 
 function nowIso() {
   return new Date().toISOString();
@@ -44,6 +45,34 @@ function proofMap(): Record<string, undefined> {
   return Object.fromEntries(config.tasks.map((task) => [task, undefined]));
 }
 
+function normalizeTaskList(tasks: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+
+  for (const task of tasks.map((item) => item.trim()).filter(Boolean)) {
+    if (seen.has(task)) {
+      continue;
+    }
+    seen.add(task);
+    normalized.push(task);
+  }
+
+  return normalized;
+}
+
+function parseTasksFromText(text: string): string[] {
+  return normalizeTaskList(
+    text
+      .split("\n")
+      .map((line) => line.replace(/^\s*[-*•]\s*/, "").trim())
+      .filter(Boolean),
+  );
+}
+
+function getDayTasks(day: DayState): string[] {
+  return day.taskOrder.length > 0 ? day.taskOrder : normalizeTaskList(Object.keys(day.tasks));
+}
+
 function withState<T>(updater: (state: AppState) => T): T {
   const state = loadState();
   const result = updater(state);
@@ -63,6 +92,7 @@ function ensureDay(profile: ChildProfile, date = todayKey()): DayState {
   if (!profile.days[date]) {
     profile.days[date] = {
       date,
+      taskOrder: [...config.tasks],
       tasks: taskMap(),
       proofs: proofMap(),
       tooHard: false,
@@ -70,7 +100,11 @@ function ensureDay(profile: ChildProfile, date = todayKey()): DayState {
     };
   }
 
-  for (const task of config.tasks) {
+  if (!profile.days[date].taskOrder || profile.days[date].taskOrder.length === 0) {
+    profile.days[date].taskOrder = normalizeTaskList(Object.keys(profile.days[date].tasks));
+  }
+
+  for (const task of getDayTasks(profile.days[date])) {
     if (!(task in profile.days[date].tasks)) {
       profile.days[date].tasks[task] = false;
     }
@@ -90,12 +124,14 @@ function rememberDisplayName(state: AppState, chatId: string, displayName?: stri
 }
 
 function progress(day: DayState) {
-  const done = config.tasks.filter((task) => day.tasks[task]).length;
-  return { done, total: config.tasks.length };
+  const tasks = getDayTasks(day);
+  const done = tasks.filter((task) => day.tasks[task]).length;
+  return { done, total: tasks.length };
 }
 
 function isAllDone(day: DayState) {
-  return config.tasks.every((task) => day.tasks[task]);
+  const tasks = getDayTasks(day);
+  return tasks.length > 0 && tasks.every((task) => day.tasks[task]);
 }
 
 function taskLabel(day: DayState, task: string) {
@@ -105,7 +141,7 @@ function taskLabel(day: DayState, task: string) {
 }
 
 function childKeyboard(day: DayState) {
-  const taskButtons = config.tasks.map((task) => [
+  const taskButtons = getDayTasks(day).map((task) => [
     Markup.button.callback(taskLabel(day, task), `${TASK_PREFIX}${task}`),
   ]);
 
@@ -123,7 +159,7 @@ function childKeyboard(day: DayState) {
 
 function renderToday(day: DayState) {
   const { done, total } = progress(day);
-  const tasks = config.tasks.map((task) => taskLabel(day, task)).join("\n");
+  const tasks = getDayTasks(day).map((task) => taskLabel(day, task)).join("\n");
 
   const moodLine =
     day.mood === "easy"
@@ -138,7 +174,7 @@ function renderToday(day: DayState) {
     ? "\nСигнал: сегодня было слишком тяжело. Лучше перейти к спокойному разговору."
     : "";
 
-  const doneLine = isAllDone(day)
+  const doneLine = total > 0 && isAllDone(day)
     ? "\n\nВсе базовые дела закрыты. Итог уже можно показать взрослым."
     : "";
 
@@ -158,7 +194,7 @@ function renderToday(day: DayState) {
 
 function renderChildSummary(chatId: string, profile: ChildProfile, day: DayState) {
   const { done, total } = progress(day);
-  const taskLines = config.tasks.map((task) => taskLabel(day, task)).join("\n");
+  const taskLines = getDayTasks(day).map((task) => taskLabel(day, task)).join("\n");
   const mood =
     day.mood === "easy"
       ? "Легко"
@@ -192,7 +228,42 @@ function renderAllSummaries(state: AppState, date = todayKey()) {
     return `Сводка за ${date}\n\nСегодня пока нет активных детских профилей.`;
   }
 
-  return summaries.join("\n\n--------------------\n\n");
+  return summaries.join(SUMMARY_SEPARATOR);
+}
+
+function renderChildrenList(state: AppState) {
+  const children = Object.entries(state.childProfiles);
+
+  if (children.length === 0) {
+    return "Пока нет ни одного детского профиля.";
+  }
+
+  return children
+    .map(([chatId, profile], index) => {
+      const name = profile.displayName || "Без имени";
+      const day = profile.days[todayKey()];
+      const progressText = day ? `${progress(day).done}/${progress(day).total}` : "нет задач";
+      return `${index + 1}. ${name}\nchat_id: ${chatId}\nСегодня: ${progressText}`;
+    })
+    .join("\n\n");
+}
+
+function setTasksForToday(profile: ChildProfile, tasks: string[]) {
+  const normalizedTasks = normalizeTaskList(tasks);
+  const day = ensureDay(profile);
+
+  day.taskOrder = normalizedTasks;
+  day.tasks = Object.fromEntries(normalizedTasks.map((task) => [task, day.tasks[task] ?? false]));
+  day.proofs = Object.fromEntries(normalizedTasks.map((task) => [task, day.proofs[task]]));
+  day.updatedAt = nowIso();
+  day.completedAt = isAllDone(day) ? nowIso() : undefined;
+  day.completionNotifiedAt = undefined;
+
+  if (profile.pendingProofTask && !normalizedTasks.includes(profile.pendingProofTask)) {
+    delete profile.pendingProofTask;
+  }
+
+  return day;
 }
 
 async function sendToday(chatId: string) {
@@ -247,6 +318,8 @@ bot.start(async (ctx) => {
         "",
         "Доступно:",
         "/summary - сводка по всем детским профилям за сегодня",
+        "/children - список детей и их chat_id",
+        "/settoday <chat_id> - задать задачи на сегодня, по одной на строку",
       ].join("\n"),
     );
     return;
@@ -298,6 +371,86 @@ bot.command("summary", async (ctx) => {
     summary,
     Markup.inlineKeyboard([[Markup.button.callback("Обновить сводку", ACTION_SUMMARY)]]),
   );
+});
+
+bot.command("children", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isParentChat(chatId)) {
+    await ctx.reply("В этом чате взрослые команды недоступны.");
+    return;
+  }
+
+  const children = withState((state) => renderChildrenList(state));
+  await ctx.reply(children);
+});
+
+bot.command("settoday", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isParentChat(chatId)) {
+    await ctx.reply("В этом чате взрослые команды недоступны.");
+    return;
+  }
+
+  const text = ctx.message.text;
+  const commandMatch = text.match(/^\/settoday(?:@\S+)?\s+(\S+)\s*\n?([\s\S]*)$/);
+
+  if (!commandMatch) {
+    await ctx.reply(
+      [
+        "Использование:",
+        "/settoday <child_chat_id>",
+        "Задача 1",
+        "Задача 2",
+        "Задача 3",
+        "",
+        "Сначала можно посмотреть /children.",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const targetChatId = commandMatch[1].trim();
+  const rawTasks = commandMatch[2] ?? "";
+  const parsedTasks = parseTasksFromText(rawTasks);
+
+  if (parsedTasks.length === 0) {
+    await ctx.reply("Не вижу задач. Пришли их после первой строки, по одной на строку.");
+    return;
+  }
+
+  const result = withState((state) => {
+    const profile = ensureChildProfile(state, targetChatId);
+    const day = setTasksForToday(profile, parsedTasks);
+    return {
+      childName: profile.displayName || targetChatId,
+      summary: renderChildSummary(targetChatId, profile, day),
+    };
+  });
+
+  await ctx.reply(
+    [
+      `Задачи на сегодня обновлены для ${result.childName}.`,
+      "",
+      result.summary,
+    ].join("\n"),
+  );
+
+  await notifyParents(
+    [
+      "Админ обновил задачи на сегодня.",
+      "",
+      result.summary,
+    ].join("\n"),
+  );
+
+  try {
+    await sendToday(targetChatId);
+  } catch (error) {
+    await ctx.reply(
+      `Задачи сохранены, но не удалось отправить их ребенку в чат ${targetChatId}. Возможно, он еще не писал боту.`,
+    );
+    console.error("Failed to push updated tasks to child chat:", error);
+  }
 });
 
 bot.action(ACTION_TODAY, async (ctx) => {
