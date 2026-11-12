@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/bot.ts",
     "start": "tsx src/bot.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "start:web": "node --env-file-if-exists=.env src/web.cjs"
   },
   "keywords": [],
   "author": "",

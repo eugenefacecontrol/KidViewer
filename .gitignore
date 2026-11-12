@@ -4,3 +4,4 @@ dist
 data/state.json
 bot.log
 bot.pid
+data/web.sqlite*
