@@ -11,9 +11,27 @@ type AppConfig = {
   tasks: string[];
 };
 
+const defaultTasks = [
+  "Почистить зубы",
+  "первые 25 минут математики",
+  "вторые 25 минут математики",
+  "Третьи 25 минут",
+  "Четвертые",
+  "Покормить животных",
+];
+
+const legacyDefaultTasks = ["Почистить зубы", "20 минут математики", "Покормить животных"];
+
+function isLegacyDefaultTaskList(tasks: string[]): boolean {
+  return (
+    tasks.length === legacyDefaultTasks.length &&
+    tasks.every((task, index) => task === legacyDefaultTasks[index])
+  );
+}
+
 function parseTasks(raw?: string): string[] {
   if (!raw) {
-    return ["Почистить зубы", "20 минут математики", "Покормить животных"];
+    return defaultTasks;
   }
 
   try {
@@ -21,7 +39,7 @@ function parseTasks(raw?: string): string[] {
     if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
       throw new Error("TASKS_JSON must be a JSON array of strings.");
     }
-    return parsed;
+    return isLegacyDefaultTaskList(parsed) ? defaultTasks : parsed;
   } catch (error) {
     throw new Error(`Failed to parse TASKS_JSON: ${(error as Error).message}`);
   }

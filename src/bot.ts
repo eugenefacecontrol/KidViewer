@@ -1,5 +1,5 @@
 import cron from "node-cron";
-import { Markup, Telegraf } from "telegraf";
+import { Context, Markup, Telegraf, TelegramError } from "telegraf";
 import { config } from "./config";
 import { AppState, ChildProfile, DayState, Mood, loadState, saveState } from "./storage";
 
@@ -11,7 +11,39 @@ const ACTION_TODAY = "action:today";
 const ACTION_TOO_HARD = "action:too_hard";
 const ACTION_SUMMARY = "action:summary";
 const ACTION_SKIP_PROOF = "action:skip_proof";
+const TEST_TASK_PREFIX = "test:task:";
+const TEST_MOOD_PREFIX = "test:mood:";
+const ACTION_TEST_TODAY = "test:action:today";
+const ACTION_TEST_TOO_HARD = "test:action:too_hard";
+const ACTION_TEST_SKIP_PROOF = "test:action:skip_proof";
 const SUMMARY_SEPARATOR = "\n\n--------------------\n\n";
+
+const BUTTON_TODAY = "📋 Сегодня";
+const BUTTON_SUMMARY = "📊 Сводка";
+const BUTTON_CHILDREN = "👧 Дети";
+const BUTTON_TEST_CHILD = "🧪 Детский тест";
+const BUTTON_SET_TODAY = "📝 Задать задачи";
+
+const LEGACY_DEFAULT_TASKS = [
+  "Почистить зубы",
+  "20 минут математики",
+  "Покормить животных",
+];
+
+const testChildProfiles = new Map<string, ChildProfile>();
+
+const childCommands = [
+  { command: "start", description: "Открыть главное меню" },
+  { command: "today", description: "Показать задачи на сегодня" },
+];
+
+const parentCommands = [
+  { command: "start", description: "Открыть главное меню" },
+  { command: "summary", description: "Сводка за сегодня" },
+  { command: "children", description: "Список детских профилей" },
+  { command: "settoday", description: "Задать задачи ребенку" },
+  { command: "testchild", description: "Проверить детский режим" },
+];
 
 function nowIso() {
   return new Date().toISOString();
@@ -35,6 +67,53 @@ function escapeHtml(value: string) {
 
 function isParentChat(chatId: string) {
   return config.parentChatIds.includes(chatId);
+}
+
+function parentMenu() {
+  return Markup.keyboard([
+    [BUTTON_SUMMARY, BUTTON_CHILDREN],
+    [BUTTON_TEST_CHILD, BUTTON_SET_TODAY],
+  ]).resize();
+}
+
+function childMenu() {
+  return Markup.keyboard([[BUTTON_TODAY]]).resize();
+}
+
+function createTestChildProfile(): ChildProfile {
+  return { displayName: "Тестовый ребенок", days: {} };
+}
+
+function getTestChildProfile(parentChatId: string): ChildProfile {
+  const profile = testChildProfiles.get(parentChatId) ?? createTestChildProfile();
+  testChildProfiles.set(parentChatId, profile);
+  return profile;
+}
+
+function resetTestChildProfile(parentChatId: string): ChildProfile {
+  const profile = createTestChildProfile();
+  testChildProfiles.set(parentChatId, profile);
+  return profile;
+}
+
+function isMessageNotModified(error: unknown): boolean {
+  return (
+    error instanceof TelegramError &&
+    error.response.error_code === 400 &&
+    error.response.description.includes("message is not modified")
+  );
+}
+
+async function editMessageIfChanged(edit: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await edit();
+    return true;
+  } catch (error) {
+    if (isMessageNotModified(error)) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function taskMap(): Record<string, boolean> {
@@ -64,9 +143,13 @@ function parseTasksFromText(text: string): string[] {
   return normalizeTaskList(
     text
       .split("\n")
-      .map((line) => line.replace(/^\s*[-*•]\s*/, "").trim())
+      .map((line) => line.replace(/^\s*(?:[-*•]|⬜️?|✅)\s*/, "").trim())
       .filter(Boolean),
   );
+}
+
+function sameTaskList(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((task, index) => task === right[index]);
 }
 
 function getDayTasks(day: DayState): string[] {
@@ -104,12 +187,30 @@ function ensureDay(profile: ChildProfile, date = todayKey()): DayState {
     profile.days[date].taskOrder = normalizeTaskList(Object.keys(profile.days[date].tasks));
   }
 
+  if (
+    sameTaskList(profile.days[date].taskOrder, LEGACY_DEFAULT_TASKS) &&
+    !sameTaskList(config.tasks, LEGACY_DEFAULT_TASKS)
+  ) {
+    profile.days[date].taskOrder = [...config.tasks];
+    profile.days[date].tasks = taskMap();
+    profile.days[date].proofs = proofMap();
+    profile.days[date].completedAt = undefined;
+    profile.days[date].completionNotifiedAt = undefined;
+    profile.days[date].updatedAt = nowIso();
+    delete profile.pendingProofTask;
+  }
+
   for (const task of getDayTasks(profile.days[date])) {
     if (!(task in profile.days[date].tasks)) {
       profile.days[date].tasks[task] = false;
     }
     if (!(task in profile.days[date].proofs)) {
       profile.days[date].proofs[task] = undefined;
+    }
+    if (profile.days[date].tasks[task] && !profile.days[date].proofs[task]) {
+      profile.days[date].tasks[task] = false;
+      profile.days[date].completedAt = undefined;
+      profile.days[date].completionNotifiedAt = undefined;
     }
   }
 
@@ -125,39 +226,43 @@ function rememberDisplayName(state: AppState, chatId: string, displayName?: stri
 
 function progress(day: DayState) {
   const tasks = getDayTasks(day);
-  const done = tasks.filter((task) => day.tasks[task]).length;
+  const done = tasks.filter((task) => day.tasks[task] && day.proofs[task]).length;
   return { done, total: tasks.length };
 }
 
 function isAllDone(day: DayState) {
   const tasks = getDayTasks(day);
-  return tasks.length > 0 && tasks.every((task) => day.tasks[task]);
+  return tasks.length > 0 && tasks.every((task) => day.tasks[task] && day.proofs[task]);
 }
 
 function taskLabel(day: DayState, task: string) {
-  const done = day.tasks[task] ? "✅" : "⬜️";
+  const done = day.tasks[task] && day.proofs[task] ? "✅" : "⬜️";
   const proof = day.proofs[task] ? "📷" : "";
   return `${done}${proof ? ` ${proof}` : ""} ${task}`;
 }
 
-function childKeyboard(day: DayState) {
+function childKeyboard(day: DayState, testMode = false) {
+  const taskPrefix = testMode ? TEST_TASK_PREFIX : TASK_PREFIX;
+  const moodPrefix = testMode ? TEST_MOOD_PREFIX : MOOD_PREFIX;
+  const tooHardAction = testMode ? ACTION_TEST_TOO_HARD : ACTION_TOO_HARD;
+  const todayAction = testMode ? ACTION_TEST_TODAY : ACTION_TODAY;
   const taskButtons = getDayTasks(day).map((task) => [
-    Markup.button.callback(taskLabel(day, task), `${TASK_PREFIX}${task}`),
+    Markup.button.callback(taskLabel(day, task), `${taskPrefix}${task}`),
   ]);
 
   return Markup.inlineKeyboard([
     ...taskButtons,
     [
-      Markup.button.callback("😊 Легко", `${MOOD_PREFIX}easy`),
-      Markup.button.callback("😐 Нормально", `${MOOD_PREFIX}ok`),
-      Markup.button.callback("😞 Тяжело", `${MOOD_PREFIX}hard`),
+      Markup.button.callback("😊 Легко", `${moodPrefix}easy`),
+      Markup.button.callback("😐 Нормально", `${moodPrefix}ok`),
+      Markup.button.callback("😞 Тяжело", `${moodPrefix}hard`),
     ],
-    [Markup.button.callback("Сегодня было слишком тяжело", ACTION_TOO_HARD)],
-    [Markup.button.callback("Обновить статус", ACTION_TODAY)],
+    [Markup.button.callback("Сегодня было слишком тяжело", tooHardAction)],
+    [Markup.button.callback("Обновить статус", todayAction)],
   ]);
 }
 
-function renderToday(day: DayState) {
+function renderToday(day: DayState, testMode = false) {
   const { done, total } = progress(day);
   const tasks = getDayTasks(day).map((task) => taskLabel(day, task)).join("\n");
 
@@ -179,8 +284,11 @@ function renderToday(day: DayState) {
     : "";
 
   return [
+    testMode ? "<b>🧪 Тестовый детский режим</b>" : undefined,
+    testMode ? "Данные не сохраняются и уведомления не отправляются.\n" : undefined,
     "<b>План на сегодня</b>",
     `Прогресс: ${done}/${total}`,
+    "Задача засчитывается только после фото.",
     "",
     escapeHtml(tasks),
     "",
@@ -285,7 +393,11 @@ async function sendParentSummary(chatId: string) {
 
 async function notifyParents(text: string) {
   for (const parentChatId of config.parentChatIds) {
-    await bot.telegram.sendMessage(parentChatId, text);
+    try {
+      await bot.telegram.sendMessage(parentChatId, text);
+    } catch (error) {
+      console.error(`Failed to notify parent chat ${parentChatId}:`, error);
+    }
   }
 }
 
@@ -308,6 +420,88 @@ async function notifyParentsIfReady(childChatId: string) {
   await notifyParents(`База дня закрыта.\n\n${result}`);
 }
 
+async function showToday(ctx: Context) {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!chatId) {
+    return;
+  }
+  if (isParentChat(chatId)) {
+    await ctx.reply("Для проверки детского экрана используй /testchild.", parentMenu());
+    return;
+  }
+
+  const day = withState((state) => {
+    rememberDisplayName(state, chatId, ctx.from?.first_name);
+    return ensureDay(ensureChildProfile(state, chatId));
+  });
+
+  await ctx.reply(renderToday(day), {
+    parse_mode: "HTML",
+    ...childKeyboard(day),
+  });
+}
+
+async function showParentSummary(ctx: Context) {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.reply("В этом чате взрослые команды недоступны.");
+    return;
+  }
+
+  const summary = withState((state) => renderAllSummaries(state));
+  await ctx.reply(
+    summary,
+    Markup.inlineKeyboard([[Markup.button.callback("Обновить сводку", ACTION_SUMMARY)]]),
+  );
+}
+
+async function showChildren(ctx: Context) {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.reply("В этом чате взрослые команды недоступны.");
+    return;
+  }
+
+  const children = withState((state) => renderChildrenList(state));
+  await ctx.reply(children);
+}
+
+async function showTestChild(ctx: Context) {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.reply("Тестовый детский режим доступен только родителям.");
+    return;
+  }
+
+  const profile = resetTestChildProfile(chatId);
+  const day = ensureDay(profile);
+  await ctx.reply(renderToday(day, true), {
+    parse_mode: "HTML",
+    ...childKeyboard(day, true),
+  });
+}
+
+async function showSetTodayHelp(ctx: Context) {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.reply("В этом чате взрослые команды недоступны.");
+    return;
+  }
+
+  await ctx.reply(
+    [
+      "Отправь сообщение в таком формате:",
+      "",
+      "/settoday <child_chat_id>",
+      "Задача 1",
+      "Задача 2",
+      "Задача 3",
+      "",
+      "Идентификаторы детей можно посмотреть кнопкой «👧 Дети».",
+    ].join("\n"),
+  );
+}
+
 bot.start(async (ctx) => {
   const chatId = String(ctx.chat.id);
 
@@ -320,7 +514,9 @@ bot.start(async (ctx) => {
         "/summary - сводка по всем детским профилям за сегодня",
         "/children - список детей и их chat_id",
         "/settoday <chat_id> - задать задачи на сегодня, по одной на строку",
+        "/testchild - безопасно проверить детский режим",
       ].join("\n"),
+      parentMenu(),
     );
     return;
   }
@@ -338,51 +534,20 @@ bot.start(async (ctx) => {
       "",
       "Взрослые функции в этом чате недоступны.",
     ].join("\n"),
+    childMenu(),
   );
 });
 
-bot.command("today", async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  if (isParentChat(chatId)) {
-    await ctx.reply("В этом чате доступен только родительский просмотр. Используй /summary.");
-    return;
-  }
+bot.command("today", showToday);
+bot.command("summary", showParentSummary);
+bot.command("children", showChildren);
+bot.command("testchild", showTestChild);
 
-  const day = withState((state) => {
-    rememberDisplayName(state, chatId, ctx.from?.first_name);
-    return ensureDay(ensureChildProfile(state, chatId));
-  });
-
-  await ctx.reply(renderToday(day), {
-    parse_mode: "HTML",
-    ...childKeyboard(day),
-  });
-});
-
-bot.command("summary", async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  if (!isParentChat(chatId)) {
-    await ctx.reply("В этом чате взрослые команды недоступны.");
-    return;
-  }
-
-  const summary = withState((state) => renderAllSummaries(state));
-  await ctx.reply(
-    summary,
-    Markup.inlineKeyboard([[Markup.button.callback("Обновить сводку", ACTION_SUMMARY)]]),
-  );
-});
-
-bot.command("children", async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  if (!isParentChat(chatId)) {
-    await ctx.reply("В этом чате взрослые команды недоступны.");
-    return;
-  }
-
-  const children = withState((state) => renderChildrenList(state));
-  await ctx.reply(children);
-});
+bot.hears(BUTTON_TODAY, showToday);
+bot.hears(BUTTON_SUMMARY, showParentSummary);
+bot.hears(BUTTON_CHILDREN, showChildren);
+bot.hears(BUTTON_TEST_CHILD, showTestChild);
+bot.hears(BUTTON_SET_TODAY, showSetTodayHelp);
 
 bot.command("settoday", async (ctx) => {
   const chatId = String(ctx.chat.id);
@@ -461,11 +626,13 @@ bot.action(ACTION_TODAY, async (ctx) => {
   }
 
   const day = withState((state) => ensureDay(ensureChildProfile(state, chatId)));
-  await ctx.editMessageText(renderToday(day), {
-    parse_mode: "HTML",
-    ...childKeyboard(day),
-  });
-  await ctx.answerCbQuery();
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(day), {
+      parse_mode: "HTML",
+      ...childKeyboard(day),
+    }),
+  );
+  await ctx.answerCbQuery(changed ? "Статус обновлен." : "Статус уже актуален.");
 });
 
 bot.action(ACTION_SUMMARY, async (ctx) => {
@@ -476,11 +643,145 @@ bot.action(ACTION_SUMMARY, async (ctx) => {
   }
 
   const summary = withState((state) => renderAllSummaries(state));
-  await ctx.editMessageText(
-    summary,
-    Markup.inlineKeyboard([[Markup.button.callback("Обновить сводку", ACTION_SUMMARY)]]),
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(
+      summary,
+      Markup.inlineKeyboard([[Markup.button.callback("Обновить сводку", ACTION_SUMMARY)]]),
+    ),
   );
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery(changed ? "Сводка обновлена." : "Сводка уже актуальна.");
+});
+
+bot.action(ACTION_TEST_TODAY, async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.answerCbQuery("Тестовый режим доступен только родителям.");
+    return;
+  }
+
+  const day = ensureDay(getTestChildProfile(chatId));
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(day, true), {
+      parse_mode: "HTML",
+      ...childKeyboard(day, true),
+    }),
+  );
+  await ctx.answerCbQuery(
+    changed ? "Тестовый статус обновлен." : "Тестовый статус уже актуален.",
+  );
+});
+
+bot.action(ACTION_TEST_SKIP_PROOF, async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.answerCbQuery("Тестовый режим доступен только родителям.");
+    return;
+  }
+
+  await ctx.answerCbQuery("Теперь фото обязательно.");
+  await ctx.reply("Тест: без фотографии задача не будет отмечена выполненной.");
+});
+
+bot.action(ACTION_TEST_TOO_HARD, async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.answerCbQuery("Тестовый режим доступен только родителям.");
+    return;
+  }
+
+  const profile = getTestChildProfile(chatId);
+  const day = ensureDay(profile);
+  day.tooHard = true;
+  day.updatedAt = nowIso();
+
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(day, true), {
+      parse_mode: "HTML",
+      ...childKeyboard(day, true),
+    }),
+  );
+  await ctx.answerCbQuery(
+    changed
+      ? "Тест: сигнал записан, уведомления не отправлены."
+      : "Тестовый сигнал уже записан.",
+  );
+});
+
+bot.action(new RegExp(`^${TEST_TASK_PREFIX}`), async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.answerCbQuery("Тестовый режим доступен только родителям.");
+    return;
+  }
+
+  const data = "data" in ctx.callbackQuery ? ctx.callbackQuery.data : "";
+  const task = data.slice(TEST_TASK_PREFIX.length);
+  const profile = getTestChildProfile(chatId);
+  const day = ensureDay(profile);
+
+  if (!(task in day.tasks)) {
+    await ctx.answerCbQuery("Не удалось найти тестовую задачу.");
+    return;
+  }
+
+  const wasCompleted = Boolean(day.tasks[task] && day.proofs[task]);
+  if (wasCompleted) {
+    day.tasks[task] = false;
+    day.proofs[task] = undefined;
+    delete profile.pendingProofTask;
+  } else {
+    day.tasks[task] = false;
+    day.proofs[task] = undefined;
+    profile.pendingProofTask = task;
+  }
+  day.updatedAt = nowIso();
+  day.completedAt = undefined;
+  day.completionNotifiedAt = undefined;
+
+  if (wasCompleted) {
+    await ctx.editMessageText(renderToday(day, true), {
+      parse_mode: "HTML",
+      ...childKeyboard(day, true),
+    });
+    await ctx.answerCbQuery("Тест: отметка снята.");
+  } else {
+    await ctx.answerCbQuery("Тест: теперь пришли фотографию.");
+    await ctx.reply(
+      `Тест: пришли фотографию для задачи «${task}». Только после фото она станет выполненной.`,
+    );
+  }
+});
+
+bot.action(new RegExp(`^${TEST_MOOD_PREFIX}`), async (ctx) => {
+  const chatId = String(ctx.chat?.id ?? "");
+  if (!isParentChat(chatId)) {
+    await ctx.answerCbQuery("Тестовый режим доступен только родителям.");
+    return;
+  }
+
+  const data = "data" in ctx.callbackQuery ? ctx.callbackQuery.data : "";
+  const mood = data.slice(TEST_MOOD_PREFIX.length) as Mood;
+  const allowedMoods: Mood[] = ["easy", "ok", "hard"];
+  if (!allowedMoods.includes(mood)) {
+    await ctx.answerCbQuery("Неизвестное настроение.");
+    return;
+  }
+
+  const day = ensureDay(getTestChildProfile(chatId));
+  day.mood = mood;
+  day.updatedAt = nowIso();
+
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(day, true), {
+      parse_mode: "HTML",
+      ...childKeyboard(day, true),
+    }),
+  );
+  await ctx.answerCbQuery(
+    changed
+      ? "Тест: настроение сохранено, уведомления не отправлены."
+      : "Тестовое настроение уже выбрано.",
+  );
 });
 
 bot.action(ACTION_SKIP_PROOF, async (ctx) => {
@@ -490,13 +791,8 @@ bot.action(ACTION_SKIP_PROOF, async (ctx) => {
     return;
   }
 
-  withState((state) => {
-    const profile = ensureChildProfile(state, chatId);
-    delete profile.pendingProofTask;
-  });
-
-  await ctx.reply("Окей, без фото. Статус по задаче уже сохранен.");
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery("Теперь фото обязательно.");
+  await ctx.reply("Без фотографии задача не будет отмечена выполненной.");
 });
 
 bot.action(ACTION_TOO_HARD, async (ctx) => {
@@ -515,13 +811,17 @@ bot.action(ACTION_TOO_HARD, async (ctx) => {
     return { day, summary: renderChildSummary(chatId, profile, day) };
   });
 
-  await ctx.editMessageText(renderToday(result.day), {
-    parse_mode: "HTML",
-    ...childKeyboard(result.day),
-  });
-  await ctx.answerCbQuery("Сигнал записан.");
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(result.day), {
+      parse_mode: "HTML",
+      ...childKeyboard(result.day),
+    }),
+  );
+  await ctx.answerCbQuery(changed ? "Сигнал записан." : "Сигнал уже записан.");
 
-  await notifyParents(`Отмечено: сегодня было слишком тяжело.\n\n${result.summary}`);
+  if (changed) {
+    await notifyParents(`Отмечено: сегодня было слишком тяжело.\n\n${result.summary}`);
+  }
 });
 
 bot.action(new RegExp(`^${TASK_PREFIX}`), async (ctx) => {
@@ -543,23 +843,39 @@ bot.action(new RegExp(`^${TASK_PREFIX}`), async (ctx) => {
       return { error: "unknown_task" as const, day };
     }
 
-    day.tasks[task] = !day.tasks[task];
-    if (!day.tasks[task]) {
+    const wasCompleted = Boolean(day.tasks[task] && day.proofs[task]);
+    const wasAlreadyPending = !wasCompleted && profile.pendingProofTask === task;
+    if (wasAlreadyPending) {
+      return {
+        day,
+        task,
+        wasCompleted,
+        wasAlreadyPending,
+        summary: renderChildSummary(chatId, profile, day),
+      };
+    }
+
+    if (wasCompleted) {
+      day.tasks[task] = false;
       day.proofs[task] = undefined;
       delete profile.pendingProofTask;
     } else {
+      day.tasks[task] = false;
+      day.proofs[task] = undefined;
       profile.pendingProofTask = task;
     }
 
     day.updatedAt = nowIso();
-    if (isAllDone(day)) {
-      day.completedAt = nowIso();
-    } else {
-      day.completedAt = undefined;
-      day.completionNotifiedAt = undefined;
-    }
+    day.completedAt = undefined;
+    day.completionNotifiedAt = undefined;
 
-    return { day, task, turnedOn: day.tasks[task] };
+    return {
+      day,
+      task,
+      wasCompleted,
+      wasAlreadyPending,
+      summary: renderChildSummary(chatId, profile, day),
+    };
   });
 
   if ("error" in result) {
@@ -567,20 +883,27 @@ bot.action(new RegExp(`^${TASK_PREFIX}`), async (ctx) => {
     return;
   }
 
-  await ctx.editMessageText(renderToday(result.day), {
-    parse_mode: "HTML",
-    ...childKeyboard(result.day),
-  });
-
-  if (result.turnedOn) {
-    await ctx.reply(
-      `Если хочешь, пришли фото как пруф для задачи: "${result.task}". Это необязательно, но удобно для прозрачности.`,
-      Markup.inlineKeyboard([[Markup.button.callback("Без фото", ACTION_SKIP_PROOF)]]),
-    );
+  if (result.wasAlreadyPending) {
+    await ctx.answerCbQuery("Для этой задачи всё ещё ждём фотографию.");
+    return;
   }
 
-  await ctx.answerCbQuery("Статус обновлен.");
-  await notifyParentsIfReady(chatId);
+  if (result.wasCompleted) {
+    await ctx.editMessageText(renderToday(result.day), {
+      parse_mode: "HTML",
+      ...childKeyboard(result.day),
+    });
+    await ctx.answerCbQuery("Отметка снята.");
+    await notifyParents(`Ребенок снял выполнение задачи «${result.task}».\n\n${result.summary}`);
+  } else {
+    await ctx.answerCbQuery("Теперь пришли фотографию.");
+    await ctx.reply(
+      `Пришли фотографию для задачи «${result.task}». Только после фото она станет выполненной.`,
+    );
+    await notifyParents(
+      `Ребенок выбрал задачу «${result.task}». Ожидается обязательное фото.\n\n${result.summary}`,
+    );
+  }
 });
 
 bot.action(new RegExp(`^${MOOD_PREFIX}`), async (ctx) => {
@@ -608,20 +931,44 @@ bot.action(new RegExp(`^${MOOD_PREFIX}`), async (ctx) => {
     return { day, summary: renderChildSummary(chatId, profile, day) };
   });
 
-  await ctx.editMessageText(renderToday(result.day), {
-    parse_mode: "HTML",
-    ...childKeyboard(result.day),
-  });
-  await ctx.answerCbQuery("Настроение сохранено.");
+  const changed = await editMessageIfChanged(() =>
+    ctx.editMessageText(renderToday(result.day), {
+      parse_mode: "HTML",
+      ...childKeyboard(result.day),
+    }),
+  );
+  await ctx.answerCbQuery(changed ? "Настроение сохранено." : "Это настроение уже выбрано.");
 
-  if (mood === "hard") {
-    await notifyParents(`Отмечено настроение: тяжело.\n\n${result.summary}`);
+  if (changed) {
+    const moodLabel =
+      mood === "easy" ? "😊 Легко" : mood === "ok" ? "😐 Нормально" : "😞 Тяжело";
+    await notifyParents(`Ребенок отметил настроение: ${moodLabel}.\n\n${result.summary}`);
   }
 });
 
 bot.on("photo", async (ctx) => {
   const chatId = String(ctx.chat.id);
   if (isParentChat(chatId)) {
+    const profile = testChildProfiles.get(chatId);
+    const pendingTask = profile?.pendingProofTask;
+    if (!profile || !pendingTask) {
+      return;
+    }
+
+    const day = ensureDay(profile);
+    day.tasks[pendingTask] = true;
+    day.proofs[pendingTask] = { receivedAt: nowIso() };
+    day.updatedAt = nowIso();
+    day.completedAt = isAllDone(day) ? nowIso() : undefined;
+    delete profile.pendingProofTask;
+
+    await ctx.reply(
+      `Тест: фото принято, задача «${pendingTask}» отмечена выполненной. Фото не сохранено в реальном профиле и не переслано.`,
+    );
+    await ctx.reply(renderToday(day, true), {
+      parse_mode: "HTML",
+      ...childKeyboard(day, true),
+    });
     return;
   }
 
@@ -639,12 +986,15 @@ bot.on("photo", async (ctx) => {
     }
 
     const day = ensureDay(profile);
+    day.tasks[pendingTask] = true;
     day.proofs[pendingTask] = { receivedAt: nowIso() };
     day.updatedAt = nowIso();
+    day.completedAt = isAllDone(day) ? nowIso() : undefined;
     delete profile.pendingProofTask;
 
     return {
       pendingTask,
+      day,
       summary: renderChildSummary(chatId, profile, day),
     };
   });
@@ -654,15 +1004,27 @@ bot.on("photo", async (ctx) => {
     return;
   }
 
-  await ctx.reply(`Пруф для задачи "${result.pendingTask}" сохранен.`);
+  await ctx.reply(
+    `Фото принято. Задача «${escapeHtml(result.pendingTask)}» отмечена выполненной.\n\n${renderToday(result.day)}`,
+    {
+      parse_mode: "HTML",
+      ...childKeyboard(result.day),
+    },
+  );
 
   for (const parentChatId of config.parentChatIds) {
-    await bot.telegram.forwardMessage(parentChatId, ctx.chat.id, ctx.message.message_id);
-    await bot.telegram.sendMessage(
-      parentChatId,
-      `Поступил пруф по задаче: ${result.pendingTask}\n\n${result.summary}`,
-    );
+    try {
+      await bot.telegram.forwardMessage(parentChatId, ctx.chat.id, ctx.message.message_id);
+      await bot.telegram.sendMessage(
+        parentChatId,
+        `Поступил пруф по задаче: ${result.pendingTask}\n\n${result.summary}`,
+      );
+    } catch (error) {
+      console.error(`Failed to deliver proof to parent chat ${parentChatId}:`, error);
+    }
   }
+
+  await notifyParentsIfReady(chatId);
 });
 
 function scheduleJobs() {
@@ -688,11 +1050,32 @@ function scheduleJobs() {
   );
 }
 
+async function configureCommandMenus() {
+  try {
+    await bot.telegram.setMyCommands(childCommands, {
+      scope: { type: "all_private_chats" },
+    });
+  } catch (error) {
+    console.error("Failed to configure the default command menu:", error);
+  }
+
+  for (const parentChatId of config.parentChatIds) {
+    try {
+      await bot.telegram.setMyCommands(parentCommands, {
+        scope: { type: "chat", chat_id: parentChatId },
+      });
+    } catch (error) {
+      console.error(`Failed to configure the parent command menu for ${parentChatId}:`, error);
+    }
+  }
+}
+
 bot.catch((error) => {
   console.error("Bot error:", error);
 });
 
 async function main() {
+  await configureCommandMenus();
   scheduleJobs();
   await bot.launch();
   console.log("KidViewer bot is running.");
