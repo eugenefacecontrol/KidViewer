@@ -79,7 +79,7 @@ const seedSchedule = db.prepare(`
 const firstDay = today();
 seedSchedule.run(-3, firstDay, 'Почистить зубы утром', 0);
 seedSchedule.run(-2, firstDay, 'Покормить животных', 1);
-seedSchedule.run(-1, firstDay, '30 минут занятий', 0);
+seedSchedule.run(-1, firstDay, '30 минут занятий', 1);
 
 const listTasks = db.prepare(`
   SELECT tasks.id, title, min_score, needs_photo, submitted_at, score, photo_type, schedule_id
